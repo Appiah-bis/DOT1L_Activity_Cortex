@@ -1,0 +1,447 @@
+---
+title: "RaceID Analysis of microinjected cells (E14.5)"
+author: "Bismark Appiah"
+date: "13 April 2020"
+output:
+  word_document: 
+    fig_height: 10
+    fig_width: 15
+    toc: yes
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages, message=FALSE, warning=FALSE}
+library(RaceID)
+library(BiocStyle)
+library(readr)
+library(data.table)
+library(dplyr)
+library(tools)
+library(SingleCellExperiment)
+library(HDF5Array)
+library(mvoutlier)
+library(scran)
+library(scater)
+library(SC3)
+library(slingshot)
+library(stringr)
+library(org.Mm.eg.db)
+library(mclust)
+library(RColorBrewer)
+library(umap)
+library(latexpdf)
+```
+
+
+# 1. Data preparation  
+#Loading data matrix
+
+Convert data to "SingleCellExperiment" Class.
+## Define DMSO and EPZ conditions  
+```{r dataprocessing, message=FALSE, include=FALSE}
+AMI_ALL_NEW <- readRDS("AMI_ALL_NEW.RData")
+sc_aMI <- SCseq(AMI_ALL_NEW)
+gm <- rownames(sc_aMI@ndata)[grep("Gm\\d+","Kcnq1","Hba-a1|Hba","Gapdh","RP23-341H2.4","A430073D23Rik", rownames(sc_aMI@ndata))]
+sc_aMI <- filterdata(sc_aMI,mintotal=2500,minexpr = 10,minnumber = 5,CGenes = gm, ccor = 0.4)
+fdata <- getfdata(sc_aMI)
+sc_aMI <- compdist(sc_aMI,metric="spearman")
+sc_aMI <- clustexp(sc_aMI,rseed = 14500)
+```
+
+```{r include=TRUE, echo=TRUE}
+plotsaturation(sc_aMI,disp=FALSE)
+plotsaturation(sc_aMI,disp=TRUE)
+```
+
+```{r satplots, include=TRUE, echo=TRUE}
+plotjaccard(sc_aMI)
+```
+
+```{r clustexp, include=FALSE}
+sc_aMI <- clustexp(sc_aMI,cln=5,sat=FALSE)
+```
+
+```{r outliers, echo=TRUE}
+sc_aMI <- findoutliers(sc_aMI,outlg = 10)
+```
+
+```{r background, echo=TRUE}
+plotbackground(sc_aMI)
+```
+
+
+```{r sensitivity, echo=TRUE}
+plotsensitivity(sc_aMI)
+```
+
+```{r outlierprobs, echo=TRUE}
+plotoutlierprobs(sc_aMI)
+```
+
+
+```{r computetsne, echo=TRUE}
+set.seed(847)
+sc_aMI <- comptsne(sc_aMI)
+```
+
+
+```{r echo=TRUE}
+plotmap(sc_aMI,cex = 2)
+```
+
+
+# Extracting marker genes for each cluster
+
+# marker genes for cluster 1
+```{r echo=TRUE}
+c1_marker <- clustdiffgenes(sc_aMI,1,pvalue=.01)
+c1_marker[1:100,]
+```
+
+
+# marker genes for cluster 2
+```{r echo=TRUE}
+c2_marker <- clustdiffgenes(sc_aMI,2,pvalue=.01)
+c2_marker[1:10,]
+```
+
+# marker genes for cluster 3
+```{r echo=TRUE}
+c3_marker <- clustdiffgenes(sc_aMI,3,pvalue=.01)
+c3_marker[1:10,]
+```
+
+# marker genes for cluster 4
+```{r echo=TRUE}
+c4_marker <- clustdiffgenes(sc_aMI,4,pvalue=.01)
+c4_marker[1:10,]
+```
+
+# marker genes for cluster 5
+```{r echo=TRUE}
+c5_marker <- clustdiffgenes(sc_aMI,5,pvalue=.01)
+c5_marker[1:20,]
+```
+
+# Extracting matrix with cellnames for Ctrl and EPZ conditions
+```{r echo=TRUE}
+DMSO24ALL_1<- sc_aMI@ndata[, grep('^aMIDMSO', colnames(sc_aMI@ndata))]
+DMSO24ALL <- colnames(DMSO24ALL_1)
+EPZ24ALL_1<- sc_aMI@ndata[, grep('^aMIEPZ', colnames(sc_aMI@ndata))]
+EPZ24ALL <- colnames(EPZ24ALL_1)
+```
+
+# DEG analysis - Ctrl vs EPZ
+```{r echo=TRUE}
+all_AMI <- diffexpnb(getfdata(sc_aMI,n=c(DMSO24ALL,EPZ24ALL)), A=DMSO24ALL, B=EPZ24ALL)
+DEGs_aMI_24h_all <- all_AMI$res[order(all_AMI$res$log2FoldChange),]
+DEGs_aMI_24h_all[1:20,]
+#write.csv2(DEGs_aMI_24h_all,file = "DEGs_E14_AMI_all.csv")
+```
+
+# t-SNE map of selected markers
+```{r }
+plotexpmap(sc_aMI,"Fabp7",logsc = T,cex = 2)
+```
+
+```{r Lars2, include=TRUE, echo=TRUE}
+plotexpmap(sc_aMI,"Lars2",logsc = T,cex = 2)
+```
+
+```{r Sst, include=TRUE, echo=TRUE}
+plotexpmap(sc_aMI,"Sst",logsc = T,cex = 2)
+```
+
+```{r Ptn, include=TRUE, echo=TRUE}
+plotexpmap(sc_aMI,"Ptn",logsc = T,cex = 2)
+```
+# Computing contribution of each condition to proportion of cells in each cluster
+```{r echo=TRUE}
+clust <- sc_aMI@cpart
+clust_pts <- data.frame(names=names(clust),cluster=clust)
+clust_pts$condition <- substr(clust_pts$names, start = 0, stop = 6)
+table_clust_pts <- table(clust_pts$condition, clust_pts$cluster)
+table_clust_pts_1 <- table_clust_pts[1:2,]
+table_clust_pts_1
+```
+
+
+```{r echo=TRUE, fig.height=10, fig.width=10}
+#A <- names(sc@cpart)[sc@cpart %in% c(2,4)]
+#B <- names(sc@cpart)[sc@cpart %in% c(3)]
+x <- diffexpnb(getfdata(sc_aMI,n=c(DMSO24ALL,EPZ24ALL)), A=DMSO24ALL, B=EPZ24ALL)
+
+plotdiffgenesnb(x,pthr=.05,lthr=.5,mthr=-1,Aname="DMSO",Bname="EPZ",show_names=TRUE,padj=TRUE)
+```
+
+
+```{r echo=TRUE}
+#write.csv2(DEGs_aMI_24h_all,file = "DEGs_E14_EUE_all.csv")
+library(ggplot2)
+library(ggrepel)
+data <- read.csv2("DEGs_E14_AMI_all.csv", header = TRUE, sep = "", quote = "\"",
+          dec = ",", fill = TRUE)
+rownames(data) <- data[,1]
+data <- data[,-1]
+data$threshold = as.factor(data$padj < 0.2)
+res_tableOE_ordered <- data[order(data$padj), ] 
+
+res_tableOE_ordered$genelabels <- ""
+res_tableOE_ordered$genelabels[1:40] <- rownames(res_tableOE_ordered)[1:40]
+
+#View(res_tableOE_ordered)
+
+ggplot(res_tableOE_ordered) +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+  geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(threshold == T, res_tableOE_ordered$genelabels,""))) +
+  ggtitle("Top 25 Differentially Expressed genes") +
+  xlab("log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) 
+
+```
+
+# DEG analysis between DMSO and EPZ for each cluster
+## DEG between DMSO and EPZ for cluster 1
+```{r echo=TRUE}
+library(RaceID)
+degs_1 <- names(sc_aMI@cpart)[sc_aMI@cpart%in% c(1)]
+degs_1_dmso <- degs_1[degs_1%in%DMSO24ALL]
+degs_1_epz <- degs_1[degs_1%in%EPZ24ALL]
+y <- diffexpnb(getfdata(sc_aMI,n=c(degs_1_dmso,degs_1_epz)), A=degs_1_dmso, B=degs_1_epz )
+E14_AMI_C1 <- y$res[order(y$res$log2FoldChange),]
+#write.csv2(E14_AMI_C1,file = "E14_AMI_C1.csv")
+```
+
+```{r echo=TRUE}
+library(ggplot2)
+library(ggrepel)
+data <- read.csv2("E14_AMI_C1.csv", header = TRUE, sep = "", quote = "\"",
+          dec = ",", fill = TRUE)
+rownames(data) <- data[,1]
+data <- data[,-1]
+data$threshold = as.factor(data$padj < 0.2)
+res_tableOE_ordered <- data[order(data$padj), ] 
+
+res_tableOE_ordered$genelabels <- ""
+res_tableOE_ordered$genelabels[1:40] <- rownames(res_tableOE_ordered)[1:40]
+
+#View(res_tableOE_ordered)
+
+ggplot(res_tableOE_ordered) +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+  geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(threshold == T, res_tableOE_ordered$genelabels,""))) +
+  ggtitle("Top 25 Differentially Expressed genes (Cluster 1)") +
+  xlab("log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) 
+
+```
+
+## DEG between DMSO and EPZ for cluster 2
+```{r echo=TRUE}
+library(RaceID)
+degs_1 <- names(sc_aMI@cpart)[sc_aMI@cpart%in% c(2)]
+degs_1_dmso <- degs_1[degs_1%in%DMSO24ALL]
+degs_1_epz <- degs_1[degs_1%in%EPZ24ALL]
+y <- diffexpnb(getfdata(sc_aMI,n=c(degs_1_dmso,degs_1_epz)), A=degs_1_dmso, B=degs_1_epz )
+E14_AMI_2 <- y$res[order(y$res$log2FoldChange),]
+#write.csv2(E14_AMI_2,file = "E14_AMI_2.csv")
+
+
+```
+
+```{r echo=TRUE}
+library(ggplot2)
+library(ggrepel)
+data <- read.csv2("E14_AMI_2.csv", header = TRUE, sep = "", quote = "\"",
+          dec = ",", fill = TRUE)
+rownames(data) <- data[,1]
+data <- data[,-1]
+data$threshold = as.factor(data$padj < 0.2)
+res_tableOE_ordered <- data[order(data$padj), ] 
+
+res_tableOE_ordered$genelabels <- ""
+res_tableOE_ordered$genelabels[1:40] <- rownames(res_tableOE_ordered)[1:40]
+
+#View(res_tableOE_ordered)
+
+ggplot(res_tableOE_ordered) +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+  geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(threshold == T, res_tableOE_ordered$genelabels,""))) +
+  ggtitle("Top 25 Differentially Expressed genes (Cluster 2)") +
+  xlab("log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) 
+
+```
+
+
+## DEG between DMSO and EPZ for cluster 3
+```{r echo=TRUE}
+library(RaceID)
+degs_1 <- names(sc_aMI@cpart)[sc_aMI@cpart%in% c(3)]
+degs_1_dmso <- degs_1[degs_1%in%DMSO24ALL]
+degs_1_epz <- degs_1[degs_1%in%EPZ24ALL]
+y <- diffexpnb(getfdata(sc_aMI,n=c(degs_1_dmso,degs_1_epz)), A=degs_1_dmso, B=degs_1_epz )
+E14_AMI_3 <- y$res[order(y$res$log2FoldChange),]
+#write.csv2(E14_AMI_3,file = "E14_AMI_3.csv")
+
+
+```
+
+```{r echo=TRUE}
+library(ggplot2)
+library(ggrepel)
+data <- read.csv2("E14_AMI_3.csv", header = TRUE, sep = "", quote = "\"",
+          dec = ",", fill = TRUE)
+rownames(data) <- data[,1]
+data <- data[,-1]
+data$threshold = as.factor(data$padj < 0.2)
+res_tableOE_ordered <- data[order(data$padj), ] 
+
+res_tableOE_ordered$genelabels <- ""
+res_tableOE_ordered$genelabels[1:40] <- rownames(res_tableOE_ordered)[1:40]
+
+#View(res_tableOE_ordered)
+
+ggplot(res_tableOE_ordered) +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+  geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(threshold == T, res_tableOE_ordered$genelabels,""))) +
+  ggtitle("Top 25 Differentially Expressed genes (Cluster 3)") +
+  xlab("log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) 
+
+```
+
+
+## DEG between DMSO and EPZ for cluster 4
+```{r echo=TRUE}
+library(RaceID)
+degs_1 <- names(sc_aMI@cpart)[sc_aMI@cpart%in% c(4)]
+degs_1_dmso <- degs_1[degs_1%in%DMSO24ALL]
+degs_1_epz <- degs_1[degs_1%in%EPZ24ALL]
+y <- diffexpnb(getfdata(sc_aMI,n=c(degs_1_dmso,degs_1_epz)), A=degs_1_dmso, B=degs_1_epz )
+E14_AMI_4 <- y$res[order(y$res$log2FoldChange),]
+#write.csv2(E14_AMI_4,file = "E14_AMI_4.csv")
+
+
+```
+
+```{r echo=TRUE}
+library(ggplot2)
+library(ggrepel)
+data <- read.csv2("E14_AMI_4.csv", header = TRUE, sep = "", quote = "\"",
+          dec = ",", fill = TRUE)
+rownames(data) <- data[,1]
+data <- data[,-1]
+data$threshold = as.factor(data$padj < 0.2)
+res_tableOE_ordered <- data[order(data$padj), ] 
+
+res_tableOE_ordered$genelabels <- ""
+res_tableOE_ordered$genelabels[1:40] <- rownames(res_tableOE_ordered)[1:40]
+
+#View(res_tableOE_ordered)
+
+ggplot(res_tableOE_ordered) +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+  geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(threshold == T, res_tableOE_ordered$genelabels,""))) +
+  ggtitle("Top 25 Differentially Expressed genes (Cluster 4)") +
+  xlab("log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) 
+
+```
+
+
+## DEG between DMSO and EPZ for cluster 5
+```{r echo=TRUE}
+library(RaceID)
+degs_1 <- names(sc_aMI@cpart)[sc_aMI@cpart%in% c(5)]
+degs_1_dmso <- degs_1[degs_1%in%DMSO24ALL]
+degs_1_epz <- degs_1[degs_1%in%EPZ24ALL]
+y <- diffexpnb(getfdata(sc_aMI,n=c(degs_1_dmso,degs_1_epz)), A=degs_1_dmso, B=degs_1_epz )
+E14_AMI_5 <- y$res[order(y$res$log2FoldChange),]
+#write.csv2(E14_AMI_5,file = "E14_AMI_5.csv")
+
+
+```
+
+```{r echo=TRUE}
+library(ggplot2)
+library(ggrepel)
+data <- read.csv2("E14_AMI_5.csv", header = TRUE, sep = "", quote = "\"",
+          dec = ",", fill = TRUE)
+rownames(data) <- data[,1]
+data <- data[,-1]
+data$threshold = as.factor(data$padj < 0.2)
+res_tableOE_ordered <- data[order(data$padj), ] 
+
+res_tableOE_ordered$genelabels <- ""
+res_tableOE_ordered$genelabels[1:40] <- rownames(res_tableOE_ordered)[1:40]
+
+#View(res_tableOE_ordered)
+
+ggplot(res_tableOE_ordered) +
+  geom_point(aes(x = log2FoldChange, y = -log10(padj), colour = threshold)) +
+  geom_text_repel(aes(x = log2FoldChange, y = -log10(padj), label = ifelse(threshold == T, res_tableOE_ordered$genelabels,""))) +
+  ggtitle("Top 25 Differentially Expressed genes (Cluster 5)") +
+  xlab("log2 fold change") + 
+  ylab("-log10 adjusted p-value") +
+  theme(legend.position = "none",
+        plot.title = element_text(size = rel(1.5), hjust = 0.5),
+        axis.title = element_text(size = rel(1.25))) 
+
+```
+
+
+DEGS_all_ELECTROPORATED_Seurat
+DEGS_all_INJECTED_Seurat
+cluster2markersall_inj
+cluster3marker_eue14
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

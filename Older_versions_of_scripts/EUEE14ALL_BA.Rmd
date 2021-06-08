@@ -1,0 +1,840 @@
+---
+title: "Analyses of Electroporated Cells (E14) with Seurat Workflow for scRNA-seq data"
+author: "Bismark Appiah"
+date: "10 April 2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages, message=FALSE, warning=FALSE}
+library(BiocStyle)
+library(readr)
+library(data.table)
+library(dplyr)
+library(tools)
+library(SingleCellExperiment)
+library(HDF5Array)
+library(mvoutlier)
+library(scran)
+library(scater)
+library(SC3)
+library(slingshot)
+library(stringr)
+library(org.Mm.eg.db)
+library(mclust)
+library(RColorBrewer)
+library(Seurat)
+library(umap)
+library(latexpdf)
+```
+
+
+
+# 1. Data preparation  
+
+#Loading data matrix  
+
+Convert data to "SingleCellExperiment" Class.
+
+```{r loading, echo=TRUE} 
+data2 <-  readRDS("EUE14ALL.RData")
+sc2 <- SingleCellExperiment(list(counts=as.matrix(data2)))
+sc2
+EUE14DMS_1 <- sc2[, grep('EUEE14DMS', colnames(sc2))]
+EUE14DMS <- colnames(EUE14DMS_1)
+
+EUE14EPZ_1 <- sc2[, grep('EUEE14EPZ', colnames(sc2))]
+EUE14EPZ <- colnames(EUE14EPZ_1)
+```
+
+#Define DMSO and EPZ conditions  
+```{r metadata, include=TRUE, echo=TRUE}
+
+
+sc2$condition <- "NA"
+sc2$condition[which(colnames(sc2) %in% EUE14DMS)] <- "DMSO"
+sc2$condition[which(colnames(sc2) %in% EUE14EPZ)] <- "EPZ"
+table(sc2$condition)
+```
+
+#Add mitochondrial genes and ERCC spike-ins to sce object  
+#There were no ERCC spike-ins used in the experiment.
+```{r spikeins, include=TRUE, echo=TRUE}
+isSpike(sc2, "MT") <- rownames(sc2)[grep("^(mt)",rownames(sc2),invert=FALSE)]
+isSpike(sc2, "ERCC") <- rownames(sc2)[grep("^(ERCC)",rownames(sc2),invert=FALSE)]
+sc2
+```
+
+# 2. Quality control  
+
+# Remove genes that are not expressed  
+
+```{r removegenes, include=TRUE, echo=TRUE}
+keep_feature <- rowSums(counts(sc2) > 0) > 0
+sc2 <- sc2[keep_feature,]
+```
+
+# Calculate quality metrics  
+
+It seems like there were no ERCC spike-ins used.
+
+```{r qualitymetrics, include=TRUE, echo=TRUE}
+sc2 <- calculateQCMetrics(sc2)
+```
+
+```{r qualplot, include=TRUE, fig.height=10, fig.width=10}
+multiplot(cols=2,
+    plotColData(sc2, x="condition", y="total_counts"),
+    plotColData(sc2, x="condition", y="total_features_by_counts"),
+    plotColData(sc2, x="condition", y="pct_counts_MT")
+)
+```
+Total counts and distribution of counts for cells in both conditions looks quite good
+We can proceed with further analysis
+
+
+```{r }
+sc2 <- sc2[grep("^(ERCC|Gm|Rik)",row.names(sc2),invert=TRUE),]
+```
+
+
+# Visualize library sizes  
+
+```{r, include=TRUE}
+hist(
+    sc2$total_counts,
+    breaks = 100
+)
+abline(v = 2500, col = "red")
+```
+
+# 3. Filter cells by library size > 2500  
+
+```{r, include=TRUE}
+filter_by_total_counts <- (sc2$total_counts > 2500)
+table(filter_by_total_counts)
+```
+
+```{r, include=TRUE}
+sc2 <- sc2[,filter_by_total_counts]
+```
+
+# 4. Visualize the total number of unique genes detected in each sample  
+
+```{r, include=TRUE}
+hist(
+    sc2$total_features_by_counts,
+    breaks = 100
+)
+abline(v = 1000, col = "red")
+```
+
+# 5. Filter cells by expressed features > 1000  
+
+```{r, include=TRUE}
+filter_by_expr_features <- (sc2$total_features_by_counts > 1000)
+table(filter_by_expr_features)
+```
+
+```{r, include=TRUE}
+sc2 <- sc2[,filter_by_expr_features]
+```
+
+Cells with outlier values for mitochondrial genes are identified based on some number of MADs from the median value.
+
+```{r, include=TRUE}
+high.mt <- isOutlier(sc2$pct_counts_MT, nmads=3, type="higher", batch=sc2$condition)
+data.frame(HighMito=sum(high.mt))
+```
+
+We only retain cells that pass all of the specified criteria.
+Of course, this involves some assumptions about independence from biology. 
+(For example, don't use the mitochondrial proportions if the number/activity of mitochondria changes between cell types.)
+
+```{r, include=TRUE}
+discard <- high.mt
+data.frame(TotalLost=sum(discard), TotalLeft=sum(!discard))
+```
+
+We toss out the cells that we consider to be low-quality, and keep the rest.
+
+```{r, include=TRUE}
+sc2 <- sc2[,!discard]
+ncol(sc2)
+```
+
+https://scrnaseq-course.cog.sanger.ac.uk/website/cleaning-the-expression-matrix.html#exprs-qc
+
+```{r, include=TRUE}
+#plotColData(sc2, x = "total_features_by_counts", y = "pct_counts_MT")
+```
+
+# 6. Examining the genes
+
+We inspect the distribution of log-mean counts across all genes.
+The peak represents the bulk of moderately expressed genes while the rectangular component corresponds to lowly expressed genes.
+
+```{r, include=TRUE}
+ave.counts <- calcAverage(sc2)
+hist(log10(ave.counts), breaks=100, main="", col="grey80",
+    xlab=expression(Log[10]~"average count"))
+```
+
+
+# 7. Show top 30 of most highly expressed genes
+
+We also look at the identities of the most highly expressed genes.
+This should generally be dominated by constitutively expressed transcripts, such as those for ribosomal or mitochondrial proteins.
+The presence of other classes of features may be cause for concern if they are not consistent with expected biology.
+
+```{r fig.height=7, fig.width=7}
+plotHighestExprs(sc2, n=30)
+```
+
+```{r, include=TRUE}
+clusters <- quickCluster(sc2,use.ranks=FALSE)
+sc2 <- computeSumFactors(sc2, cluster=clusters)
+```
+
+From: Lun et al. (2016) A step-by-step workflow for low-level analysis of single-cell RNA-seq data with Bioconductor.
+
+"In this case, the size factors are tightly correlated with the library sizes for all cells. This suggests that the
+systematic differences between cells are primarily driven by differences in capture efficiency or sequencing depth. Any
+DE between cells would yield a non-linear trend between the total count and size factor, and/or increased scatter around
+the trend. This does not occur here as strong DE is unlikely to exist within a homogeneous population of cells."
+
+In our case there is also a linear trend, but with some scatter around it.
+
+```{r, include=TRUE}
+plot(sizeFactors(sc2), sc2$total_counts/1e3, log="xy",
+ylab="Library size (thousands)", xlab="Size factor")
+```
+
+```{r, include=TRUE}
+sc2 <- scater::normalize(sc2)
+sc2
+```
+
+
+
+```{r, include=TRUE}
+var.fit <- trendVar(sc2, method="loess", loess.args=list(span=0.05), use.spikes=FALSE)
+var.out <- decomposeVar(sc2, var.fit)
+#head(var.out)    
+```
+
+#We can have a look at the fitted trend.
+#Some tinkering may be required to get a good fit, usually by modifying `span=`
+
+```{r hvgplothsc, include=TRUE}
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+    ylab="Variance of log-expression")
+curve(var.fit$trend(x), add=TRUE, col="dodgerblue", lwd=2)
+cur.spike <- isSpike(sc2)
+points(var.out$mean[cur.spike], var.out$total[cur.spike], col="red", pch=16)
+```
+
+```{r, include=TRUE}
+hvg.out <- var.out[with(var.out, order(bio,FDR, decreasing = TRUE)),][1:800,]
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing = TRUE),]
+nrow(hvg.out)
+```
+
+# 8. Checking the distribution of expression values for the top HVGs
+This ensures that the variance estimate is not being dominated by one or two outlier cells.
+
+```{r, include=TRUE}
+plotExpression(sc2, rownames(hvg.out)[1:10])
+```
+
+# 9. Extract highly variable genes (HVG)  
+ 
+```{r, include=TRUE}
+sce_hvg <- sc2[row.names(hvg.out),]
+```
+
+# 10. Seurat clustering analysis  
+
+Convert SingleCellExperiment object into Seurat object.
+
+```{r}
+rownames(sce_hvg) <- str_remove(rownames(sce_hvg), "[|]")
+```
+
+
+```{r}
+sce_hvg.seurat <- as.Seurat(x = sce_hvg)
+```
+
+Scaling data before running PCA.
+
+```{r}
+all.genes <- rownames(sce_hvg.seurat)
+sce_hvg.seurat <- ScaleData(sce_hvg.seurat, features = all.genes)
+```
+
+
+```{r removeercc}
+sce_hvg.seurat <- sce_hvg.seurat[grep("^(mt)",row.names(sce_hvg.seurat),invert=TRUE),]
+```
+
+
+# 11. Run PCA on Seurat object.
+
+```{r}
+sce_hvg.seurat <- RunPCA(sce_hvg.seurat, npcs = 60, features = rownames(sce_hvg.seurat))
+```
+
+# 12. Inspecting first two principal components
+```{r}
+VizDimLoadings(sce_hvg.seurat, dims = 1:2, reduction = "pca")
+```
+
+
+```{r include=FALSE}
+DimPlot(sce_hvg.seurat, reduction = "pca")
+```
+
+# 13. Showing heatmap of first 10 principal components
+```{r}
+DimHeatmap(sce_hvg.seurat, dims = 1:10, cells = 500, balanced = TRUE)
+```
+
+Heatmap allows to see some structure in the data. It suggest that the first 8 PCs include some structure. These can then be used for the cluster analysis.
+
+# 14. Determine the dimensionality of the dataset  
+
+This part is based on: https://satijalab.org/seurat/v3.0/pbmc3k_tutorial.html
+
+"To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a ‘null distribution’ of feature scores, and repeat this procedure. We identify ‘significant’ PCs as those who have a strong enrichment of low p-value features."
+
+```{r}
+sce_hvg.seurat <- JackStraw(sce_hvg.seurat, num.replicate = 100, dims = 20)
+sce_hvg.seurat <- ScoreJackStraw(sce_hvg.seurat, dims = 1:20)
+```
+
+```{r}
+JackStrawPlot(sce_hvg.seurat, dims = 1:20, xmax = 0.75, ymax = 1.0)
+```
+
+
+```{r include=FALSE}
+ElbowPlot(sce_hvg.seurat, ndims = 15, reduction = "pca")
+```
+
+The more approximate elbow plot also suggests to use 8 PCs.
+
+# 15. Cluster evaluation  
+
+Run Seurat clustering with varying resolution parameters to assess cluster stability. Parameter is varied between 0.4 to 1.2 in steps of 0.1. The resulting clusterings are then compared to each other using the adjusted rand index (ARI).
+
+
+Compute average silhouette width for resolution parameter.
+
+
+
+# 16. Cluster the cells  
+
+Using a resolution of 0.4 seems to be the most stable version according to the average silhouette and ARI.
+
+```{r}
+sce_hvg.seurat <- FindNeighbors(sce_hvg.seurat, dims = 1:10)
+sce_hvg.seurat <- FindClusters(sce_hvg.seurat, resolution = 0.4, algorithm = 1)
+```
+
+```{r}
+head(Idents(sce_hvg.seurat), 5)
+```
+
+# 17. Run UMAP for visualization in two dimensions  
+
+```{r}
+sce_hvg.seurat <- RunUMAP(sce_hvg.seurat, dims = 1:8)
+DimPlot(sce_hvg.seurat, reduction = "umap")
+```
+
+# Computing contribution of each condition to proportion of cells in each cluster
+```{r echo=TRUE}
+clust <- sce_hvg.seurat$seurat_clusters
+clust_pts <- data.frame(names=names(clust),cluster=clust)
+clust_pts$condition <- substr(clust_pts$names, start = 0, stop = 9)
+table_clust_pts <- table(clust_pts$condition, clust_pts$cluster)
+```
+
+
+# 18. Finding differentially expressed features (cluster biomarkers)  
+
+## Markers for Cluster 0  
+
+```{r}
+# find all markers of cluster 0
+cluster0.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 0)
+head(cluster0.markers, n = 10)
+#write.csv2(cluster5.markers,file = "cluster5marker_eue14.csv")
+#FeaturePlot(sce_hvg.seurat, features = "Stmn1")
+
+```
+
+# UMAP visualization of top 10 markers for Cluster 0
+```{r fig.height=10, fig.width=15}
+FeaturePlot(sce_hvg.seurat, features = c(row.names(cluster0.markers)[1:10]))
+```
+
+## Markers for Cluster 1  
+
+```{r}
+# find all markers of cluster 1
+cluster1.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 1)
+head(cluster1.markers, n = 10)
+```
+
+# UMAP visualization of top 10 markers for Cluster 1
+```{r fig.height=10, fig.width=15}
+FeaturePlot(sce_hvg.seurat, features = c(row.names(cluster1.markers)[1:10]))
+```
+
+## Markers for Cluster 2  
+
+```{r}
+# find all markers of cluster 2
+cluster2.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 2)
+head(cluster2.markers, n = 20)
+```
+
+# UMAP visualization of top 10 markers for Cluster 2
+```{r fig.height=10, fig.width=15}
+FeaturePlot(sce_hvg.seurat, features = c(row.names(cluster2.markers)[1:10]))
+```
+
+
+## Markers for Cluster 3  
+
+```{r}
+# find all markers of cluster 3
+cluster3.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 3)
+head(cluster3.markers, n = 10)
+```
+
+# UMAP visualization of top 10 markers for Cluster 3
+```{r fig.height=10, fig.width=15}
+FeaturePlot(sce_hvg.seurat, features = c(row.names(cluster3.markers)[1:10]))
+```
+
+## Markers for Cluster 4
+
+```{r}
+# find all markers of cluster 4
+cluster4.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 4)
+head(cluster4.markers, n = 10)
+```
+
+# UMAP visualization of top 10 markers for Cluster 4
+```{r fig.height=10, fig.width=15}
+FeaturePlot(sce_hvg.seurat, features = c(row.names(cluster4.markers)[1:10]))
+```
+
+
+## Markers for Cluster 5  
+
+```{r}
+# find all markers of cluster 5
+cluster5.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 5)
+head(cluster5.markers, n = 10)
+```
+
+# UMAP visualization of top 10 markers for Cluster 5
+```{r fig.height=10, fig.width=15}
+FeaturePlot(sce_hvg.seurat, features = c(row.names(cluster5.markers)[1:10]))
+```
+
+
+# 19. Computing differential markers for each cluster compared to all other cells
+Idea is to look at markers highly specific for each cluster. You will find cluster labels in column 6 with corresponding cluster-specific marker gene in column 7 of table below
+```{r}
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+sce_hvg.seurat.markers <- FindAllMarkers(sce_hvg.seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+sce_hvg.seurat.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+```
+
+
+# 20. Showing top 10 marker genes in each cluster as a heatmap
+```{r fig.height=10, fig.width=10}
+top10 <- sce_hvg.seurat.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_logFC)
+DoHeatmap(sce_hvg.seurat, features = top10$gene) + NoLegend()
+```
+
+
+# 21. UMAP representation of cells in each condition (DMSO/EPZ)
+From here, we can compute proportions of cells for each cluster. 
+```{r fig.height=5, fig.width=10}
+DimPlot(sce_hvg.seurat, reduction = "umap", split.by = "condition", pt.size = 1.5)
+```
+
+
+# 22. Using Slingshot for pseudotime analysis  
+
+From: https://www.bioconductor.org/packages/release/bioc/vignettes/slingshot/inst/doc/vignette.html#using-slingshot
+
+```{r}
+library(slingshot)
+sce_hvg.slingshot <- as.SingleCellExperiment(sce_hvg.seurat)
+```
+
+## Gaussian mixture model for clustering  
+
+```{r include=FALSE}
+cl1 <- Mclust(reducedDim(sce_hvg.slingshot)[,1:2])$classification
+cl1 <- Idents(sce_hvg.seurat)
+colData(sce_hvg.slingshot)$GMM <- cl1
+
+plot(reducedDim(sce_hvg.slingshot)[,1:2], col = brewer.pal(9,"Set1")[cl1], pch=16, asp = 1)
+```
+
+```{r}
+sce_hvg.slingshot <- slingshot::slingshot(sce_hvg.slingshot, clusterLabels = 'GMM', reducedDim = 'UMAP')
+```
+
+```{r}
+summary(sce_hvg.slingshot$slingPseudotime_1)
+```
+
+
+# 23. Lineage structure visualized cluster-wise
+```{r fig.height=10, fig.width=10}
+plot(reducedDims(sce_hvg.slingshot)$UMAP, col = brewer.pal(9,'Set1')[sce_hvg.slingshot$seurat_clusters], pch=16, asp = 1)
+lines(SlingshotDataSet(sce_hvg.slingshot), lwd=2, type = 'lineages', col = 'black')
+```
+
+
+```{r fig.height=10, fig.width=10}
+
+#Computing DEGs between EPZ and DMSO
+colnames(sce_hvg.seurat[[]])
+Idents(object = sce_hvg.seurat) <- 'condition'
+levels(sce_hvg.seurat)
+alldegs <- FindMarkers(sce_hvg.seurat, ident.1 = "EPZ", ident.2 = "DMSO",test.use = "negbinom",verbose = F)
+ordered.degs_all <- alldegs[which(alldegs$p_val_adj < 0.05),]
+write.csv2(ordered.degs_all,file = "Final_DEGS_all_ELECTROPORATED_Seurat.csv")
+
+# Extracting seurat object for DMSO cells
+sce_hvg.seurat_DMSO <- subset(sce_hvg.seurat,subset= condition=="DMSO")
+#Extracting seurat object for EPZ cells
+sce_hvg.seurat_EPZ <- subset(sce_hvg.seurat,subset= condition=="EPZ")
+
+
+#Cluster annotation
+#colnames(sce_hvg.seurat[[]])
+#Idents(object = sce_hvg.seurat) <- 'seurat_clusters'
+#levels(sce_hvg.seurat)
+
+
+#current.cluster.ids <- c(0, 1, 2, 3, 4,5)
+#new.cluster.ids <- c("Apical Progenitor (Cluster 1)","Intermediate Progenitor (Cluster 2)","Neuron 2 (Cluster 5)", "Transit Cells (Cluster 3)","Neuron 1 (Cluster 4)","Endothelial Cells (Cluster 6")
+#sce_hvg.seurat@active.ident <- plyr::mapvalues(sce_hvg.seurat@active.ident, from = current.cluster.ids, to = new.cluster.ids)
+
+
+##New cluster annotation
+colnames(sce_hvg.seurat[[]])
+Idents(object = sce_hvg.seurat) <- 'seurat_clusters'
+levels(sce_hvg.seurat)
+
+
+current.cluster.ids <- c(0, 1, 2, 3, 4,5)
+new.cluster.ids <- c("Apical progenitors","Intermediate progenitors","Neurons II", "Transit cells","Neurons I","Endothelial cells")
+names(new.cluster.ids) <- levels(sce_hvg.seurat)
+sce_hvg.seurat <- RenameIdents(sce_hvg.seurat, new.cluster.ids)
+#choose a color pallette for clusters
+t <- brewer.pal(n = 6,name = "Dark2")
+DimPlot(sce_hvg.seurat, reduction = "umap", label = TRUE, cols = t,pt.size = 2.5,label.size = 8) + NoLegend()
+
+
+sce_hvg.seurat@active.ident <- plyr::mapvalues(sce_hvg.seurat@active.ident, from = current.cluster.ids, to = new.cluster.ids)
+
+
+
+
+
+ClustXvsAP <- FindMarkers(sce_hvg.seurat, ident.1=3, ident.2=0)
+Increased_ClustXvsAP <- ClustXvsAP[which(ClustXvsAP$avg_logFC > 0),]
+Decreased_ClustXvsAP <- ClustXvsAP[which(ClustXvsAP$avg_logFC < 0),]
+write.csv2(Increased_ClustXvsAP,file = "IncreasedinClustX_relative_to_AP_Electroporated.csv")
+write.csv2(Decreased_ClustXvsAP,file = "DecreasedinClustX_relative_to_AP_Electroporated.csv")
+
+
+ClustXvsNeuron2 <- FindMarkers(sce_hvg.seurat, ident.1=3, ident.2=2)
+Increased_ClustXvsNeuron2 <- ClustXvsNeuron2[which(ClustXvsNeuron2$avg_logFC > 0),]
+Decreased_ClustXvsNeuron2 <- ClustXvsNeuron2[which(ClustXvsNeuron2$avg_logFC < 0),]
+
+write.csv2(Increased_ClustXvsNeuron2,file = "IncreasedinClustX_relative_to_Neuron2_Electroporated.csv")
+write.csv2(Decreased_ClustXvsNeuron2,file = "DecreasedinClustX_relative_to_Neuron2_Electroporated.csv")
+
+
+
+
+#Computing DEGs between conditions for each cluster
+
+colnames(sce_hvg.seurat[[]])
+Idents(object = sce_hvg.seurat) <- 'seurat_clusters'
+levels(sce_hvg.seurat)
+sce_hvg.seurat$condition <- paste(Idents(sce_hvg.seurat), sce_hvg.seurat$condition, sep = "_")
+Idents(sce_hvg.seurat) <- "condition"
+
+#Identifying Cluster 3
+C3vsAPs <- FindMarkers(sce_hvg.seurat, ident.1 = "3_DMSO", ident.2 = "0_DMSO",test.use = "negbinom")
+
+C3vsAPs_UPinC3 <- C3vsAPs[which(C3vsAPs$avg_logFC > 0),]
+write.csv2(C3vsAPs_UPinC3,file = "Increased_In_C3_comp_AP_DMSO_electroporated.csv")
+
+C3vsAPs_DOWNinC3 <- C3vsAPs[which(C3vsAPs$avg_logFC < 0),]
+write.csv2(C3vsAPs_DOWNinC3,file = "Decreased_In_C3_comp_AP_DMSO_electroporated.csv")
+
+
+
+C3vsNeu <- FindMarkers(sce_hvg.seurat, ident.1 = "3_DMSO", ident.2 = "2_DMSO",test.use = "negbinom")
+
+C3vsNeu_UPinC3 <- C3vsNeu[which(C3vsNeu$avg_logFC > 0),]
+write.csv2(C3vsNeu_UPinC3,file = "Increased_In_C3_comp_Neu_DMSO_electroporated.csv")
+
+C3vsNeu_DOWNinC3 <- C3vsNeu[which(C3vsNeu$avg_logFC < 0),]
+write.csv2(C3vsNeu_DOWNinC3,file = "Decreased_In_C3_comp_Neu_DMSO_electroporated.csv")
+
+
+
+C3vsIP <- FindMarkers(sce_hvg.seurat, ident.1 = "3_DMSO", ident.2 = "1_DMSO",test.use = "negbinom")
+
+C3vsIP_UPinC3 <- C3vsIP[which(C3vsIP$avg_logFC > 0),]
+write.csv2(C3vsIP_UPinC3,file = "Increased_In_C3_comp_IP_DMSO_electroporated.csv")
+
+C3vsIP_DOWNinC3 <- C3vsIP[which(C3vsIP$avg_logFC < 0),]
+write.csv2(C3vsIP_DOWNinC3,file = "Decreased_In_C3_comp_IP_DMSO_electroporated.csv")
+
+
+#DEG analysis between C3 EPZ vs ctrl
+EPZvsCtrl_C3 <- FindMarkers(sce_hvg.seurat, ident.1 = "3_EPZ", ident.2 = "3_DMSO",test.use = "negbinom")
+EPZvsCtrl_C3_UPinC3 <- EPZvsCtrl_C3 [which(EPZvsCtrl_C3 $avg_logFC > 0),]
+write.csv2(EPZvsCtrl_C3_UPinC3,file = "Increased_In_EPZ_C3_comp_DMSO_electroporated.csv")
+
+EPZvsCtrl_C3_DOWNinC3 <- EPZvsCtrl_C3[which(EPZvsCtrl_C3$avg_logFC < 0),]
+write.csv2(EPZvsCtrl_C3_DOWNinC3,file = "Decreased_In_EPZ_C3_comp_DMSO_electroporated.csv")
+
+
+
+
+
+
+
+#Cluster 0
+#DEGc0 <- FindMarkers(sce_hvg.seurat, ident.1 = "3_DMSO", ident.2 = "0_DMSO",test.use = "negbinom")
+ordered.degs_C0 <- DEGc0[which(DEGc0$p_val_adj < 0.1),]
+
+ordered.degs_C0_DOWN <- ordered.degs_C0[which(ordered.degs_C0$avg_logFC < 0),]
+write.csv2(ordered.degs_C0_DOWN,file = "Final_DEGS_Clust0_ELECTROPORATED_DOWN_Seurat.csv")
+
+ordered.degs_C0_UP <- ordered.degs_C0[which(ordered.degs_C0$avg_logFC > 0),]
+write.csv2(ordered.degs_C0_UP,file = "Final_DEGS_Clust0_ELECTROPORATED_UP_Seurat.csv")
+
+#Cluster 1
+
+DEGc1 <- FindMarkers(sce_hvg.seurat, ident.1 = "1_EPZ", ident.2 = "1_DMSO",test.use = "negbinom")
+ordered.degs_C1 <- DEGc1[which(DEGc1$p_val_adj < 0.05),]
+
+ordered.degs_C1_DOWN <- ordered.degs_C1[which(ordered.degs_C1$avg_logFC < 0),]
+write.csv2(ordered.degs_C1_DOWN,file = "Final_DEGS_Clust1_ELECTROPORATED_DOWN_Seurat.csv")
+
+ordered.degs_C1_UP <- ordered.degs_C1[which(ordered.degs_C1$avg_logFC > 0),]
+write.csv2(ordered.degs_C1_UP,file = "Final_DEGS_Clust1_ELECTROPORATED_UP_Seurat.csv")
+
+#Cluster 2
+DEGc2 <- FindMarkers(sce_hvg.seurat, ident.1 = "2_EPZ", ident.2 = "2_DMSO",test.use = "negbinom")
+ordered.degs_C2 <- DEGc2[which(DEGc2$p_val_adj < 0.05),]
+
+ordered.degs_C2_DOWN <- ordered.degs_C2[which(ordered.degs_C2$avg_logFC < 0),]
+write.csv2(ordered.degs_C2_DOWN,file = "Final_DEGS_Clust2_ELECTROPORATED_DOWN_Seurat.csv")
+
+ordered.degs_C2_UP <- ordered.degs_C2[which(ordered.degs_C2$avg_logFC > 0),]
+write.csv2(ordered.degs_C2_UP,file = "Final_DEGS_Clust2_ELECTROPORATED_UP_Seurat.csv")
+
+#Cluster 3
+DEGc3 <- FindMarkers(sce_hvg.seurat, ident.1 = "3_EPZ", ident.2 = "3_DMSO",test.use = "negbinom")
+ordered.degs_C3 <- DEGc3[which(DEGc3$p_val_adj < 0.05),]
+
+ordered.degs_C3_DOWN <- ordered.degs_C3[which(ordered.degs_C3$avg_logFC < 0),]
+write.csv2(ordered.degs_C3_DOWN,file = "Final_DEGS_Clust3_ELECTROPORATED_DOWN_Seurat.csv")
+
+ordered.degs_C3_UP <- ordered.degs_C3[which(ordered.degs_C3$avg_logFC > 0),]
+write.csv2(ordered.degs_C3_UP,file = "Final_DEGS_Clust3_ELECTROPORATED_UP_Seurat.csv")
+
+#Cluster 4
+DEGc4 <- FindMarkers(sce_hvg.seurat, ident.1 = "4_EPZ", ident.2 = "4_DMSO",test.use = "negbinom")
+ordered.degs_C4 <- DEGc4[which(DEGc4$p_val_adj < 0.05),]
+
+ordered.degs_C4_DOWN <- ordered.degs_C4[which(ordered.degs_C4$avg_logFC < 0),]
+write.csv2(ordered.degs_C4_DOWN,file = "Final_DEGS_Clust4_ELECTROPORATED_DOWN_Seurat.csv")
+
+ordered.degs_C4_UP <- ordered.degs_C4[which(ordered.degs_C4$avg_logFC > 0),]
+write.csv2(ordered.degs_C4_UP,file = "Final_DEGS_Clust4_ELECTROPORATED_UP_Seurat.csv")
+
+#Cluster 5
+DEGc5 <- FindMarkers(sce_hvg.seurat, ident.1 = "5_EPZ", ident.2 = "5_DMSO",test.use = "negbinom")
+ordered.degs_C5 <- DEGc5[which(DEGc5$p_val_adj < 0.05),]
+
+ordered.degs_C5_DOWN <- ordered.degs_C5[which(ordered.degs_C5$avg_logFC < 0),]
+write.csv2(ordered.degs_C5_DOWN,file = "Final_DEGS_Clust5_ELECTROPORATED_DOWN_Seurat.csv")
+
+ordered.degs_C5_UP <- ordered.degs_C0[which(ordered.degs_C0$avg_logFC > 0),]
+write.csv2(ordered.degs_C5_UP,file = "Final_DEGS_Clust5_ELECTROPORATED_UP_Seurat.csv")
+
+
+
+
+
+
+
+
+
+
+
+
+
+#alldegs <- FindMarkers(sce_hvg.seurat, ident.1 = "EPZ", ident.2 = "DMSO")
+#write.csv2(alldegs,file = "DEGS_all_ELECTROPORATED_Seurat.csv")
+
+
+
+
+
+
+
+
+
+# find all markers of cluster 
+cluster0.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 0)
+ordered.markers_C0 <- cluster0.markers[which(cluster0.markers$p_val_adj < 0.05),]
+
+ordered.markers_C0_DOWN <- ordered.markers_C0[which(ordered.markers_C0$avg_logFC < 0),]
+write.csv2(ordered.markers_C0_DOWN,file = "Markers_Clust0_ELECTROPORATED_DOWN.csv")
+
+ordered.markers_C0_UP <- ordered.markers_C0[which(ordered.markers_C0$avg_logFC > 0),]
+write.csv2(ordered.markers_C0_UP,file = "Markers_Clust0_ELECTROPORATED_UP.csv")
+
+
+#write.csv2(ordered.markers_C4,file = "Markers_Clust4_INJECTED.csv")
+#1
+cluster1.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 1)
+ordered.markers_C1 <- cluster1.markers[which(cluster1.markers$p_val_adj < 0.05),]
+
+ordered.markers_C1_DOWN <- ordered.markers_C1[which(ordered.markers_C1$avg_logFC < 0),]
+write.csv2(ordered.markers_C1_DOWN,file = "Markers_Clust1_ELECTROPORATED_DOWN.csv")
+
+ordered.markers_C1_UP <- ordered.markers_C1[which(ordered.markers_C1$avg_logFC > 0),]
+write.csv2(ordered.markers_C1_UP,file = "Markers_Clust1_ELECTROPORATED_UP.csv")
+
+# find all markers of cluster 
+cluster2.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 2)
+ordered.markers_C2 <- cluster2.markers[which(cluster2.markers$p_val_adj < 0.05),]
+
+ordered.markers_C2_DOWN <- ordered.markers_C2[which(ordered.markers_C2$avg_logFC < 0),]
+write.csv2(ordered.markers_C2_DOWN,file = "Markers_Clust2_ELECTROPORATED_DOWN.csv")
+
+ordered.markers_C2_UP <- ordered.markers_C2[which(ordered.markers_C2$avg_logFC > 0),]
+write.csv2(ordered.markers_C2_UP,file = "Markers_Clust2_ELECTROPORATED_UP.csv")
+
+
+
+# find all markers of cluster 
+cluster3.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 3)
+ordered.markers_C3 <- cluster3.markers[which(cluster3.markers$p_val_adj < 0.05),]
+
+ordered.markers_C3_DOWN <- ordered.markers_C3[which(ordered.markers_C3$avg_logFC < 0),]
+write.csv2(ordered.markers_C3_DOWN,file = "Markers_Clust3_ELECTROPORATED_DOWN.csv")
+
+ordered.markers_C3_UP <- ordered.markers_C3[which(ordered.markers_C3$avg_logFC > 0),]
+write.csv2(ordered.markers_C3_UP,file = "Markers_Clust3_ELECTROPORATED_UP.csv")
+
+
+
+# find all markers of cluster 
+cluster4.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 4)
+ordered.markers_C4 <- cluster4.markers[which(cluster4.markers$p_val_adj < 0.05),]
+
+ordered.markers_C4_DOWN <- ordered.markers_C4[which(ordered.markers_C4$avg_logFC < 0),]
+write.csv2(ordered.markers_C4_DOWN,file = "Markers_Clust4_ELECTROPORATED_DOWN.csv")
+
+ordered.markers_C4_UP <- ordered.markers_C4[which(ordered.markers_C4$avg_logFC > 0),]
+write.csv2(ordered.markers_C4_UP,file = "Markers_Clust4_ELECTROPORATED_UP.csv")
+
+# find all markers of cluster 
+cluster5.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 5)
+ordered.markers_C5 <- cluster5.markers[which(cluster5.markers$p_val_adj < 0.05),]
+
+ordered.markers_C5_DOWN <- ordered.markers_C5[which(ordered.markers_C5$avg_logFC < 0),]
+write.csv2(ordered.markers_C5_DOWN,file = "Markers_Clust5_ELECTROPORATED_DOWN.csv")
+
+ordered.markers_C5_UP <- ordered.markers_C5[which(ordered.markers_C5$avg_logFC > 0),]
+write.csv2(ordered.markers_C5_UP,file = "Markers_Clust5_ELECTROPORATED_UP.csv")
+
+
+
+
+
+FeaturePlot(sce_hvg.seurat, features = c("Tubb3","Tbr1"))
+
+DotPlot(sce_hvg.seurat, features = c("Fabp7","Sox2","Insm1","Eomes","Tubb3","Tbr1","Bcl11b","Satb2")) + RotatedAxis()
+
+
+RidgePlot(sce_hvg.seurat, features = c("Fabp7","Sox2","Insm1","Eomes","Tubb3","Tbr1","Bcl11b","Satb2"), ncol = 2)
+```
+
+
+
+
+DotPlot(sce_hvg.seurat, features = c("Hes1","Hes5","Sox9","Ptprz1","Ttyh1","Fabp7","Sox2","Nusap1","Insm1","Sox5","Eomes","Neurog2","Dcx","Neurod6","Dpysl3","Elavl3","Tubb3","Tbr1","Bcl11b","Satb2")) + RotatedAxis()
+
+
+FeaturePlot(sce_hvg.seurat, features = c("Fgfr3","Hk2"),split.by = "condition")
+
+DotPlot(sce_hvg.seurat, features = c("Hes1","Hes5","Sox9","Ptprz1","Ttyh1","Fabp7","Sox2","Nusap1","Fgfr3","Hk2","Zbtb20","Nr2f1","Insm1","Sox5","Eomes","Neurog2","Dcx","Neurod6","Dpysl3","Elavl3","Tubb3","Tbr1","Bcl11b")) + RotatedAxis()
+
+
+DotPlot(sce_hvg.seurat, features = c("Hes1","Hes5","Sox9","Ptprz1","Ttyh1","Fabp7","Sox2","Nusap1","Fgfr3","Hk2","Zbtb20","Nr2f1","Insm1","Sox5","Eomes","Neurog2","Fezf2","Pou3f2","Map2","Gap43","Dcx","Neurod6","Dpysl3","Elavl3","Tubb3","Tbr1","Bcl11b")) + RotatedAxis()
+
+
+
+K1 = DotPlot(sce_hvg.seurat_DMSO, features = c("Hes1","Hes5","Sox9","Ptprz1","Ttyh1","Fabp7","Sox2","Nusap1","Fgfr3","Hk2","Zbtb20","Nr2f1","Insm1","Sox5","Eomes","Neurog2","Fezf2","Pou3f2","Map2","Gap43","Dcx","Neurod6","Dpysl3","Elavl3","Tubb3","Tbr1","Bcl11b"),) + RotatedAxis()
+K1 + labs(title = "                                DMSO")
+
+K2 = DotPlot(sce_hvg.seurat_EPZ, features = c("Hes1","Hes5","Sox9","Ptprz1","Ttyh1","Fabp7","Sox2","Nusap1","Fgfr3","Hk2","Zbtb20","Nr2f1","Insm1","Sox5","Eomes","Neurog2","Fezf2","Pou3f2","Map2","Gap43","Dcx","Neurod6","Dpysl3","Elavl3","Tubb3","Tbr1","Bcl11b")) + RotatedAxis()
+K2 + labs(title = "                                EPZ")
+
+
+
+
+
+
+DimPlot(sce_hvg.seurat, reduction = "umap", label = TRUE, cols = t,pt.size = 2.5,label.size = 5,split.by = "condition") + NoLegend()
+DimPlot(sce_hvg.seurat, reduction = "umap", label = TRUE, cols = t,pt.size = 2.5,label.size = 8) + NoLegend()
+
+
+P1 = FeaturePlot(sce_hvg.seurat, features = c("Zbtb20","Nr2f1"),split.by = "condition",pt.size = 2.5)
+P2 = DimPlot(sce_hvg.seurat, reduction = "umap", label = TRUE, cols = t,pt.size = 2.5,label.size = 5,split.by = "condition") + NoLegend()
+
+# Session info  
+
+```{r, echo=TRUE}
+sessionInfo()
+```
+
+
+
+
+
+
