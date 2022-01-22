@@ -1,0 +1,394 @@
+---
+title: "Cluster Annotation and differential expression"
+author: "Bismark Appiah"
+date: "15 December 2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r packages, message=FALSE, warning=FALSE}
+library(BiocStyle)
+library(readr)
+library(data.table)
+library(dplyr)
+library(patchwork)
+library(tools)
+library(SingleCellExperiment)
+library(HDF5Array)
+library(mvoutlier)
+library(scran)
+library(scater)
+library(SC3)
+library(slingshot)
+library(stringr)
+library(org.Mm.eg.db)
+library(mclust)
+library(RColorBrewer)
+library(Seurat)
+library(umap)
+library(latexpdf)
+library(cowplot)
+```
+
+# 1. Data preparation  
+#Loading data matrix
+
+Convert data to "SingleCellExperiment" Class.
+## Define DMSO and EPZ conditions  
+```{r loading, echo=TRUE} 
+AMI_ALL_NEW <- readRDS("AMI_ALL_NEW.RData")
+
+sce <- SingleCellExperiment(list(counts=as.matrix(AMI_ALL_NEW)))
+rm(AMI_ALL_NEW)
+sce
+DM24 <- readRDS("DM24.RData")
+EP24 <- readRDS("EP24.RData")
+
+sce$condition <- "NA"
+sce$condition[which(colnames(sce) %in% DM24)] <- "DMS24"
+sce$condition[which(colnames(sce) %in% EP24)] <- "EPZ24"
+
+table(sce$condition)
+
+```
+
+
+
+## Add mitochondrial genes and ERCC spike-ins to sce object  
+
+There were no ERCC spike-ins used in the experiment.
+
+```{r spikeins, include=TRUE, echo=TRUE}
+isSpike(sce, "MT") <- rownames(sce)[grep("^(mt)",rownames(sce),invert=FALSE)]
+isSpike(sce, "ERCC") <- rownames(sce)[grep("^(ERCC)",rownames(sce),invert=FALSE)]
+sce
+```
+
+# 2. Quality control  
+
+#Remove genes that are not expressed  
+```{r removegenes, include=TRUE, echo=TRUE}
+keep_feature <- rowSums(counts(sce) > 0) > 0
+sce <- sce[keep_feature,]
+```
+
+#Calculate quality metrics  
+It seems like there were no ERCC spike-ins used.
+```{r qualitymetrics, include=TRUE, echo=TRUE}
+sce <- calculateQCMetrics(sce)
+```
+
+```{r qualplot, include=TRUE, fig.height=10, fig.width=10}
+multiplot(cols=2,
+    plotColData(sce, x="condition", y="total_counts"),
+    plotColData(sce, x="condition", y="total_features_by_counts"),
+    plotColData(sce, x="condition", y="pct_counts_MT")
+)
+```
+Total counts and distribution of counts for cells in both conditions looks good
+We can proceed with further analysis
+
+# Remove ERCC spike-ins since they were not used.
+```{r }
+sce <- sce[grep("^(ERCC|Gm|Rik)",row.names(sce),invert=TRUE),]
+```
+
+
+# Visualize library sizes  
+
+```{r, include=TRUE}
+hist(
+    sce$total_counts,
+    breaks = 100
+)
+abline(v = 2500, col = "red")
+```
+
+# 3. Filter cells by library size > 2500  
+
+```{r, include=TRUE}
+filter_by_total_counts <- (sce$total_counts > 2500)
+table(filter_by_total_counts)
+```
+
+```{r, include=TRUE}
+sce <- sce[,filter_by_total_counts]
+```
+
+# 4. Visualize the total number of unique genes detected in each sample  
+
+```{r, include=TRUE}
+hist(
+    sce$total_features_by_counts,
+    breaks = 100
+)
+abline(v = 1000, col = "red")
+```
+
+# 5. Filter cells by expressed features > 1000  
+
+```{r, include=TRUE}
+filter_by_expr_features <- (sce$total_features_by_counts > 1000)
+table(filter_by_expr_features)
+```
+
+```{r, include=TRUE}
+sce <- sce[,filter_by_expr_features]
+```
+
+Cells with outlier values for mitochondrial genes are identified based on some number of MADs from the median value.
+
+```{r, include=TRUE}
+high.mt <- isOutlier(sce$pct_counts_MT, nmads=3, type="higher", batch=sce$condition)
+data.frame(HighMito=sum(high.mt))
+```
+
+We only retain cells that pass all of the specified criteria.
+Of course, this involves some assumptions about independence from biology. 
+(For example, don't use the mitochondrial proportions if the number/activity of mitochondria changes between cell types.)
+
+```{r, include=TRUE}
+discard <- high.mt
+data.frame(TotalLost=sum(discard), TotalLeft=sum(!discard))
+```
+
+We toss out the cells that we consider to be low-quality, and keep the rest.
+
+```{r, include=TRUE}
+sce <- sce[,!discard]
+ncol(sce)
+```
+
+https://scrnaseq-course.cog.sanger.ac.uk/website/cleaning-the-expression-matrix.html#exprs-qc
+
+```{r, include=TRUE}
+#plotColData(sce, x = "total_features_by_counts", y = "pct_counts_MT")
+```
+
+# 6. Examining the genes
+
+We inspect the distribution of log-mean counts across all genes.
+The peak represents the bulk of moderately expressed genes while the rectangular component corresponds to lowly expressed genes.
+
+```{r, include=TRUE}
+ave.counts <- calcAverage(sce)
+hist(log10(ave.counts), breaks=100, main="", col="grey80",
+    xlab=expression(Log[10]~"average count"))
+```
+
+# 7. Show top 30 of most highly expressed genes
+
+We also look at the identities of the most highly expressed genes.
+This should generally be dominated by constitutively expressed transcripts, such as those for ribosomal or mitochondrial proteins.
+The presence of other classes of features may be cause for concern if they are not consistent with expected biology.
+
+```{r fig.height=7, fig.width=7}
+plotHighestExprs(sce, n=30)
+```
+
+```{r, include=TRUE}
+clusters <- quickCluster(sce,use.ranks=FALSE)
+sce <- computeSumFactors(sce, cluster=clusters)
+```
+
+From: Lun et al. (2016) A step-by-step workflow for low-level analysis of single-cell RNA-seq data with Bioconductor.
+
+"In this case, the size factors are tightly correlated with the library sizes for all cells. This suggests that the
+systematic differences between cells are primarily driven by differences in capture efficiency or sequencing depth. Any
+DE between cells would yield a non-linear trend between the total count and size factor, and/or increased scatter around
+the trend. This does not occur here as strong DE is unlikely to exist within a homogeneous population of cells."
+
+In our case there is also a linear trend, but with some scatter around it.
+
+```{r, include=TRUE}
+plot(sizeFactors(sce), sce$total_counts/1e3, log="xy",
+ylab="Library size (thousands)", xlab="Size factor")
+```
+
+```{r, include=TRUE}
+sce <- scater::normalize(sce)
+sce
+```
+
+
+# 8. Modelling the technical component of variation
+
+We identify HVGs to focus on the genes that are driving heterogeneity across the population of cells.
+This requires estimation of the variance in expression for each gene, followed by decomposition of the variance into biological and technical components.
+
+From: Lun et al. (2016) A step-by-step workflow for low-level analysis of single-cell RNA-seq data with Bioconductor.
+
+"HVGs  are  defined  as  genes  with  biological  components  that  are  significantly  greater  than  zero  at  a  false  discovery rate (FDR) of 5%. These genes are interesting as they drive differences in the expression profiles between cells, and should be prioritized for further investigation. In addition, we only consider a gene to be a HVG if it has a biological component greater than or equal to 0.5. For transformed expression values on the log2 scale, this means that the average  difference  in  true  expression  between  any  two  cells  will  be  at  least  2-fold.  (This  reasoning  assumes  that the true log-expression values are Normally distributed with variance of 0.5. The root-mean-square of the difference between two values is treated as the average log2-fold change between cells and is equal to unity.) We rank the results by the biological component to focus on genes with larger biological variability."
+
+```{r, include=TRUE}
+var.fit <- trendVar(sce, method="loess", loess.args=list(span=0.05), use.spikes=FALSE)
+var.out <- decomposeVar(sce, var.fit)
+#head(var.out)    
+```
+
+"We can have a look at the fitted trend.
+Some tinkering may be required to get a good fit, usually by modifying `span=`."
+
+```{r hvgplothsc, include=TRUE}
+plot(var.out$mean, var.out$total, pch=16, cex=0.6, xlab="Mean log-expression", 
+    ylab="Variance of log-expression")
+curve(var.fit$trend(x), add=TRUE, col="dodgerblue", lwd=2)
+cur.spike <- isSpike(sce)
+points(var.out$mean[cur.spike], var.out$total[cur.spike], col="red", pch=16)
+```
+
+# Extracting highly variable genes (HVG)
+I selected 800 of the HVGs extracted for clustering. This helps to focus on the genes that are driving heterogeneity across the population of cells.
+```{r, include=TRUE}
+hvg.out <- var.out[with(var.out, order(bio,FDR, decreasing = TRUE)),][1:800,]
+hvg.out <- hvg.out[order(hvg.out$bio, decreasing = TRUE),]
+nrow(hvg.out)
+```
+
+
+# 9. Checking the distribution of expression values for the top HVGs
+This ensures that the variance estimate is not being dominated by one or two outlier cells.
+
+```{r fig.height=5, fig.width=7, include=TRUE}
+plotExpression(sce, rownames(hvg.out)[1:10])
+```
+
+# 10. Extract highly variable genes (HVG)  
+ 
+```{r, include=TRUE}
+sce_hvg <- sce[row.names(hvg.out),]
+```
+
+# 11. Seurat clustering analysis  
+
+Convert SingleCellExperiment object into Seurat object.
+
+```{r}
+rownames(sce_hvg) <- str_remove(rownames(sce_hvg), "[|]")
+```
+
+
+```{r}
+sce_hvg.seurat <- as.Seurat(x = sce_hvg)
+```
+
+Scaling data before running PCA.
+
+```{r}
+all.genes <- rownames(sce_hvg.seurat)
+sce_hvg.seurat <- ScaleData(sce_hvg.seurat, features = all.genes)
+```
+
+
+```{r removeercc}
+sce_hvg.seurat <- sce_hvg.seurat[grep("^(mt)",row.names(sce_hvg.seurat),invert=TRUE),]
+```
+
+
+# 12. Run PCA on Seurat object
+
+```{r}
+sce_hvg.seurat <- RunPCA(sce_hvg.seurat, npcs = 60, features = rownames(sce_hvg.seurat))
+```
+
+# 13. Inspecting first two principal components
+
+```{r}
+VizDimLoadings(sce_hvg.seurat, dims = 1:2, reduction = "pca")
+```
+
+```{r include=FALSE}
+DimPlot(sce_hvg.seurat, reduction = "pca")
+```
+
+# 14. Showing heatmap of first 10 principal components
+
+```{r}
+DimHeatmap(sce_hvg.seurat, dims = 1:10, cells = 500, balanced = TRUE)
+```
+
+Heatmap allows to see some structure in the data. It suggest that the first 8 PCs include some structure. These can then be used for the cluster analysis.
+
+# 15. Determine the dimensionality of the dataset  
+
+This part is based on: https://satijalab.org/seurat/v3.0/pbmc3k_tutorial.html
+
+"To overcome the extensive technical noise in any single feature for scRNA-seq data, Seurat clusters cells based on their PCA scores, with each PC essentially representing a ‘metafeature’ that combines information across a correlated feature set. The top principal components therefore represent a robust compression of the dataset. However, how many components should we choose to include? 10? 20? 100?
+
+In Macosko et al, we implemented a resampling test inspired by the JackStraw procedure. We randomly permute a subset of the data (1% by default) and rerun PCA, constructing a ‘null distribution’ of feature scores, and repeat this procedure. We identify ‘significant’ PCs as those who have a strong enrichment of low p-value features."
+
+```{r}
+sce_hvg.seurat <- JackStraw(sce_hvg.seurat, num.replicate = 100, dims = 20)
+sce_hvg.seurat <- ScoreJackStraw(sce_hvg.seurat, dims = 1:20)
+```
+
+```{r}
+JackStrawPlot(sce_hvg.seurat, dims = 1:20, xmax = 0.75, ymax = 1.0)
+```
+
+The drop of the p-value at PC8 suggest to use the first 8 dimensions for clustering.
+
+```{r echo=FALSE}
+ElbowPlot(sce_hvg.seurat, ndims = 15, reduction = "pca")
+```
+The more approximate elbow plot also suggests to use 8 PCs.
+
+
+Cluster evaluation  
+
+Run Seurat clustering with varying resolution parameters to assess cluster stability. Parameter is varied between 0.4 to 1.2 in steps of 0.1. The resulting clusterings are then compared to each other using the adjusted rand index (ARI).
+
+Compute average silhouette width for resolution parameter.
+
+
+
+
+# 16. Cluster the cells  
+
+Using a resolution of 0.4 seems to be the most stable version according to the average silhouette and ARI.
+
+```{r}
+sce_hvg.seurat <- FindNeighbors(sce_hvg.seurat, dims = 1:8)
+sce_hvg.seurat <- FindClusters(sce_hvg.seurat, resolution = 0.4, algorithm = 1)
+
+```
+
+```{r}
+head(Idents(sce_hvg.seurat), 10)
+```
+
+# 17. Find markers for each cluster
+```{r}
+# find markers for each cluster
+cluster0.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 0)
+cluster1.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 1)
+cluster2.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 2)
+cluster3.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 3)
+cluster4.markers <- FindMarkers(sce_hvg.seurat, ident.1 = 4)
+head(cluster3.markers, n = 10)
+```
+
+```{r}
+sce_hvg.seurat <- RunUMAP(sce_hvg.seurat, dims = 1:8)
+t <- brewer.pal(n = 6,name = "Dark2") # Assigning color code for clusters
+# Renaming clusters
+
+colnames(sce_hvg.seurat[[]])
+Idents(object = sce_hvg.seurat) <- 'seurat_clusters'
+levels(sce_hvg.seurat)
+
+sce_hvg.seurat$condition <- paste(Idents(sce_hvg.seurat), sce_hvg.seurat$condition, sep = "_")
+Idents(sce_hvg.seurat) <- "condition"
+
+```
+
+```{r}
+
+### Find markers for every cluster compared to all remaining cells, report only the positive ones
+sce_hvg.seurat.markers <- FindAllMarkers(sce_hvg.seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+sce_hvg.seurat.markers %>% group_by(cluster) %>% top_n(n = 2, wt = avg_logFC)
+```
